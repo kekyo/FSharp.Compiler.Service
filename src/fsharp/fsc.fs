@@ -1952,6 +1952,7 @@ let main1(tcGlobals, tcImports: TcImports, frameworkTcImports, generatedCcu, typ
     // data structures involved here are so large we can't take the risk.
     Args(tcConfig, tcImports, frameworkTcImports, tcGlobals, errorLogger, generatedCcu, outfile, typedAssembly, topAttrs, pdbfile, assemblyName, assemVerFromAttrib, signingInfo, exiter)
 
+open System.Linq
 
 // set up typecheck for given AST without parsing any command line parameters
 let main1OfAst (openBinariesInMemory, assemblyName, target, outfile, pdbFile, dllReferences, noframework, exiter, errorLoggerProvider: ErrorLoggerProvider, inputs : ParsedInput list) =
@@ -1961,10 +1962,7 @@ let main1OfAst (openBinariesInMemory, assemblyName, target, outfile, pdbFile, dl
     tcConfigB.framework <- not noframework 
     // Preset: --optimize+ -g --tailcalls+ (see 4505)
     SetOptimizeSwitch tcConfigB OptionSwitch.On
-    SetDebugSwitch    tcConfigB None (
-        match pdbFile with
-        | Some _ -> OptionSwitch.On
-        | None -> OptionSwitch.Off)
+    SetDebugSwitch    tcConfigB None OptionSwitch.Off
     SetTailcallSwitch tcConfigB OptionSwitch.On
     tcConfigB.target <- target
     tcConfigB.sqmNumOfSourceFiles <- 1
@@ -1972,6 +1970,62 @@ let main1OfAst (openBinariesInMemory, assemblyName, target, outfile, pdbFile, dl
     let errorLogger = errorLoggerProvider.CreateErrorLoggerThatQuitsAfterMaxErrors (tcConfigB, exiter)
 
     tcConfigB.conditionalCompilationDefines <- "COMPILED" :: tcConfigB.conditionalCompilationDefines
+    
+    let (|Null|Primitive|String|Enumerable|Complex|) (target: obj) =
+      match target with
+      | null -> Null
+      | _ ->
+        let targetType = target.GetType()
+        match targetType.IsPrimitive || targetType.IsEnum with
+        | true -> Primitive(targetType)
+        | false ->
+          match targetType = typeof<System.String> with
+          | true -> String(target :?> System.String)
+          | false ->
+            match typeof<System.Collections.IEnumerable>.IsAssignableFrom targetType with
+            | true -> Enumerable(target :?> System.Collections.IEnumerable |> Seq.cast<obj>)
+            | false -> Complex(targetType)
+
+    let rec dumper target name indent =
+      match target with
+      | Null -> seq {
+        yield System.String.Format("{0}{1} = null", indent, name)
+       }
+      | Primitive _ -> seq {
+        yield System.String.Format("{0}{1} = {2}", indent, name, target)
+       }
+      | String str -> seq {
+        yield System.String.Format("{0}{1} = \"{2}\"", indent, name, str)
+       }
+      | Enumerable en -> seq {
+        yield System.String.Format("{0}{1} = [", indent, name)
+        let childIndent = indent + "  "
+        let mutable index = 0
+        for child in en do
+          yield! dumper child (System.String.Format("[{0}]", index)) childIndent
+          index <- index + 1
+        yield System.String.Format("{0}]", indent)
+       }
+      | Complex targetType -> seq {
+        yield System.String.Format("{0}{1} = {{", indent, name)
+        let pis = targetType.GetProperties(BindingFlags.Public ||| BindingFlags.NonPublic ||| BindingFlags.Instance ||| BindingFlags.DeclaredOnly)
+        let filter (pi: PropertyInfo) = 
+          let getter = pi.GetMethod
+          let indexers = pi.GetIndexParameters()
+          pi.CanRead && (indexers.Length = 0) && (getter <> null) && (not getter.IsPrivate)
+        let fpis = pis |> Seq.filter filter |> Seq.sortBy (fun pi -> pi.Name) |> Seq.toArray
+        let childIndent = indent + "  "
+        for pi in fpis do
+          let child = pi.GetValue(target, null)
+          yield! dumper child pi.Name childIndent
+        yield System.String.Format("{0}}}", indent)
+       }
+
+    let dump =
+      System.String.Join(
+        "\r\n",
+        dumper tcConfigB "tcConfigB" "")
+    do Console.WriteLine(dump)
 
     // append assembly dependencies
     dllReferences |> List.iter (fun ref -> tcConfigB.AddReferencedAssemblyByPath(rangeStartup,ref))
